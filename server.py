@@ -1756,8 +1756,8 @@ def _recent_user_text(messages: list[dict], n: int = 3) -> str:
     the classifier sees the actual task context and routes correctly.
 
     Includes up to n user messages and up to n-1 assistant replies (interleaved).
-    Assistant messages are truncated to 200 chars to stay within classifier
-    context windows (SetFit/zero-shot use all-MiniLM-L6-v2 with 256 token limit).
+    Assistant messages are included in full — fastText and the surrogate have no
+    context length limit, and SetFit/zero-shot truncate internally at 256 tokens.
 
     Messages are joined with " | " separator (not newlines) to keep the input
     compact for fastText/SetFit which work best on short text.
@@ -1783,7 +1783,6 @@ def _recent_user_text(messages: list[dict], n: int = 3) -> str:
         if role == "assistant":
             if asst_count >= n - 1:
                 continue
-            text = text[:200]
             asst_count += 1
         else:
             if user_count >= n:
