@@ -12,19 +12,30 @@ import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-TRACE_FILE = SCRIPT_DIR / "traces" / "router-trace-pretrain.jsonl"
+TRACE_DIR = SCRIPT_DIR / "traces"
 OUTPUT_DIR = SCRIPT_DIR / ".router" / "fasttext"
+
+def _load_all_traces():
+    """Load classify events from all trace files (pretrain + live + hermes-sessions)."""
+    import glob
+    all_samples = []
+    for tf in sorted(glob.glob(str(TRACE_DIR / "router-trace-*.jsonl"))):
+        for line in open(tf):
+            try:
+                d = json.loads(line)
+                if d.get("event") == "classify" and d.get("user_message_preview"):
+                    all_samples.append(d)
+            except: pass
+    return all_samples
 
 def main():
     import fasttext
 
-    # Load training data
-    if not TRACE_FILE.exists():
-        print("ERROR: No pretrain traces found. Run pretrain_surrogate.py first.")
+    # Load training data from all trace files
+    samples = _load_all_traces()
+    if not samples:
+        print("ERROR: No traces found. Run pretrain_surrogate.py or label_hermes_sessions.py first.")
         sys.exit(1)
-
-    lines = TRACE_FILE.read_text().strip().split("\n")
-    samples = [json.loads(l) for l in lines]
     print(f"Loaded {len(samples)} training samples")
 
     # Convert to fastText format: __label__category text

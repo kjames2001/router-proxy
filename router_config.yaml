@@ -5,7 +5,7 @@ classifier:
   fasttext:
     enabled: true
     model_path: .router/fasttext/model.ftz
-    confidence_threshold: 0.90
+    confidence_threshold: 0.68
   setfit:
     enabled: true
     model_path: .router/setfit
@@ -14,6 +14,11 @@ classifier:
     enabled: true
     path: .router/surrogate
     confidence_threshold: 0.85
+  laya:
+    enabled: true
+    model: convaiinnovations/laya-multilingual
+    device: cpu
+    confidence_threshold: 0.3
   profile_hint: simple
   system_prompt: 'Classify the user''s message into exactly one of these categories:
 
