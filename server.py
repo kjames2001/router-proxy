@@ -516,20 +516,31 @@ def _strip_override(text: str, cfg: dict) -> str:
     return text
 
 
-def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is_first: bool = True) -> str:
+def classify(cfg: dict, user_message: str, *, session_key: str | None = None,
+             is_first: bool = True, context_window: bool = False) -> str:
     """
     Classify a user message into one of the configured categories.
 
     Classification priority (cheapest first):
       0. fastText classifier (<0.01ms, bag-of-words + n-grams, trained model)
       1. SetFit classifier (~10ms, fine-tuned sentence transformer, trained model)
-      2. Zero-shot embedding classifier (~10ms, no training, cosine similarity)
-      3. ML surrogate (TRACER-inspired, ~0.1ms, needs trained model)
-      4. LLM classifier (slow, costs tokens, most accurate)
+      2. ML surrogate (TRACER-inspired, ~0.1ms, needs trained model)
+      3. Zero-shot embedding classifier (~10ms, no training, cosine similarity)
+      4. Laya classifier (~370ms, self-contained, no external server)
+      4b. LLM classifier fallback (if laya disabled/failed)
 
     Falls back to the first category on any failure.
+
+    When context_window=True, the surrogate threshold is lowered from 0.85
+    to 0.30 because context-window input (multiple messages concatenated)
+    naturally produces lower confidence scores. Without this, the surrogate
+    always defers on context-window input and zero-shot catches it with
+    wrong general-purpose similarity.
     """
     names = _category_names(cfg)
+
+    # Surrogate threshold override for context-window classification
+    surrogate_threshold = 0.30 if context_window else None
 
     # ── Tier 0: fastText classifier (ultra-fast, <0.01ms) ──────────────
     fasttext_clf = get_fasttext(cfg)
@@ -587,7 +598,48 @@ def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is
                 user_message[:60], confidence, setfit_clf.confidence_threshold,
             )
 
-    # ── Tier 2: Zero-shot embedding classifier (no LLM) ───────────────
+    # ── Tier 2: ML surrogate (TRACER-inspired, ~0.1ms, trained model) ──
+    # Runs before zero-shot because the surrogate is trained on our taxonomy
+    # and is more accurate for our specific category boundaries. Zero-shot
+    # catches general-purpose similarity but can misclassify boundary cases
+    # (e.g., "check this repo ... do it" -> homeassistant instead of code).
+    surrogate = _get_surrogate(cfg)
+
+    if surrogate is not None:
+        # Use lower threshold for context-window classification
+        effective_threshold = surrogate_threshold if surrogate_threshold is not None else surrogate.confidence_threshold
+        label, confidence = surrogate.predict(user_message)
+        # Verify surrogate label is a valid category
+        if confidence >= effective_threshold and label in names:
+            latency_ms = 0.1
+            _record_classifier_latency(latency_ms)
+
+            log.info(
+                "Surrogate classified: '%s' → %s (%.2f confidence, threshold %.2f%s)",
+                user_message[:60], label, confidence, effective_threshold,
+                " [ctx]" if context_window else "",
+            )
+
+            trace_classify(
+                session_key=session_key or "?",
+                user_message=user_message,
+                classifier_result=label,
+                classifier_raw=f"surrogate:{confidence:.4f}",
+                latency_ms=latency_ms,
+                tier=label,
+                model=f"surrogate/{surrogate.manifest.get('surrogate_method', 'unknown')}",
+                is_first=is_first,
+            )
+
+            return label
+        else:
+            log.info(
+                "Surrogate uncertain: '%s' (%.2f < %.2f threshold%s) — deferring to next classifier",
+                user_message[:60], confidence, effective_threshold,
+                " [ctx]" if context_window else "",
+            )
+
+    # ── Tier 3: Zero-shot embedding classifier (no LLM) ───────────────
     zero_shot = get_zero_shot(cfg)
     if zero_shot is not None:
         label, confidence = zero_shot.classify(user_message)
@@ -613,39 +665,6 @@ def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is
             log.info(
                 "Zero-shot uncertain: '%s' (%.3f < %.2f) — deferring to next classifier",
                 user_message[:60], confidence, zero_shot.confidence_threshold,
-            )
-
-    # ── Tier 3: ML surrogate (TRACER-inspired, ~0.1ms, trained model) ──
-    surrogate = _get_surrogate(cfg)
-
-    if surrogate is not None:
-        label, confidence = surrogate.predict(user_message)
-        # Verify surrogate label is a valid category
-        if confidence >= surrogate.confidence_threshold and label in names:
-            latency_ms = 0.1
-            _record_classifier_latency(latency_ms)
-
-            log.info(
-                "Surrogate classified: '%s' → %s (%.2f confidence, threshold %.2f)",
-                user_message[:60], label, confidence, surrogate.confidence_threshold,
-            )
-
-            trace_classify(
-                session_key=session_key or "?",
-                user_message=user_message,
-                classifier_result=label,
-                classifier_raw=f"surrogate:{confidence:.4f}",
-                latency_ms=latency_ms,
-                tier=label,
-                model=f"surrogate/{surrogate.manifest.get('surrogate_method', 'unknown')}",
-                is_first=is_first,
-            )
-
-            return label
-        else:
-            log.info(
-                "Surrogate uncertain: '%s' (%.2f < %.2f threshold) — deferring to LLM",
-                user_message[:60], confidence, surrogate.confidence_threshold,
             )
 
     # ── Tier 4: Laya classifier (self-contained, ~370ms, no external server) ──
@@ -1274,7 +1293,7 @@ async def route_request_stream(cfg: dict, payload: dict):
             else:
                 # Context-window: classify last 3 user messages, not just this one
                 ctx_content = _recent_user_text(messages, n=3)
-                category = classify(cfg, ctx_content, session_key=key, is_first=False)
+                category = classify(cfg, ctx_content, session_key=key, is_first=False, context_window=True)
             cache_tier(key, category)
         else:
             last_text = _last_user_text(messages)
@@ -1293,7 +1312,7 @@ async def route_request_stream(cfg: dict, payload: dict):
                 else:
                     # Context-window: classify last 3 user messages on deviation
                     ctx_content = _recent_user_text(messages, n=3)
-                    category = classify(cfg, ctx_content, session_key=key, is_first=False)
+                    category = classify(cfg, ctx_content, session_key=key, is_first=False, context_window=True)
                 cache_tier(key, category)
             else:
                 category = cached
@@ -1596,7 +1615,7 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
             else:
                 # Context-window: classify last 3 user messages, not just this one
                 ctx_content = _recent_user_text(messages, n=3)
-                category = classify(cfg, ctx_content, session_key=key, is_first=False)
+                category = classify(cfg, ctx_content, session_key=key, is_first=False, context_window=True)
             cache_tier(key, category)
         else:
             last_text = _last_user_text(messages)
@@ -1616,7 +1635,7 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
                 else:
                     # Context-window: classify last 3 user messages on deviation
                     ctx_content = _recent_user_text(messages, n=3)
-                    category = classify(cfg, ctx_content, session_key=key, is_first=False)
+                    category = classify(cfg, ctx_content, session_key=key, is_first=False, context_window=True)
                 if category != cached:
                     log.info("Session %s category changed: %s → %s", key, cached, category)
                 cache_tier(key, category)
