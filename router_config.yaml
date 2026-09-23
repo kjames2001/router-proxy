@@ -50,7 +50,7 @@ classifier:
   zero_shot:
     enabled: true
     model_name: all-MiniLM-L6-v2
-    confidence_threshold: 0.1
+    confidence_threshold: 0.25
     descriptions:
       chat:
       - hello how are you
