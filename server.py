@@ -762,6 +762,11 @@ def has_deviation(cfg: dict, text: str, current_category: str, *, session_key: s
     With N categories, deviation is no longer a simple tier swap.
     Instead, any escalation keyword triggers full re-classification.
     De-escalation keywords force the default (first) category.
+
+    Additionally, very short follow-up messages (< 30 chars) that aren't
+    greetings/thanks are treated as continuation triggers — they likely
+    refer to the ongoing task context ("do it", "yes", "go ahead", "sure")
+    and should be reclassified with context-window to catch category drift.
     """
     # Check for /use: override first
     override = _detect_override(text, cfg)
@@ -808,6 +813,32 @@ def has_deviation(cfg: dict, text: str, current_category: str, *, session_key: s
                     model=model,
                 )
                 return True
+
+    # Short continuation heuristic: very short messages that aren't explicit
+    # greetings/thanks are likely task continuations ("do it", "yes", "go ahead").
+    # Force reclassification with context window to catch category drift.
+    _SHORT_CONTINUATION_MAX_LEN = 30
+    _GREETING_PATTERNS = {"hello", "hi", "hey", "thanks", "thank you", "thx",
+                          "ok", "okay", "got it", "understood", "makes sense",
+                          "perfect", "good job", "nice", "cool", "awesome",
+                          "great", "cheers", "bye", "goodbye", "see you",
+                          "你好", "谢谢", "好的", "明白了", "再见"}
+    text_lower = text.strip().lower()
+    if len(text_lower) < _SHORT_CONTINUATION_MAX_LEN and text_lower not in _GREETING_PATTERNS:
+        # Check if it's a bare greeting word (longer than 2 chars to avoid "hi"/"ok" overlap)
+        is_greeting = any(text_lower == g for g in _GREETING_PATTERNS if len(g) <= 4)
+        if not is_greeting:
+            log.info("Deviation: short continuation '%s' (%d chars) — forcing context reclassification",
+                     text[:40], len(text_lower))
+            trace_deviation(
+                session_key=session_key or "?",
+                keyword="short_continuation",
+                direction="context",
+                previous_tier=current_category,
+                new_tier="unknown",
+                model="unknown",
+            )
+            return True
 
     return False
 
@@ -1241,7 +1272,9 @@ async def route_request_stream(cfg: dict, payload: dict):
                             break
                     payload["messages"] = messages
             else:
-                category = classify(cfg, user_content, session_key=key, is_first=False)
+                # Context-window: classify last 3 user messages, not just this one
+                ctx_content = _recent_user_text(messages, n=3)
+                category = classify(cfg, ctx_content, session_key=key, is_first=False)
             cache_tier(key, category)
         else:
             last_text = _last_user_text(messages)
@@ -1258,8 +1291,9 @@ async def route_request_stream(cfg: dict, payload: dict):
                                 break
                         payload["messages"] = messages
                 else:
-                    user_content = _last_user_text(messages)
-                    category = classify(cfg, user_content, session_key=key, is_first=False)
+                    # Context-window: classify last 3 user messages on deviation
+                    ctx_content = _recent_user_text(messages, n=3)
+                    category = classify(cfg, ctx_content, session_key=key, is_first=False)
                 cache_tier(key, category)
             else:
                 category = cached
@@ -1560,7 +1594,9 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
                             break
                     payload["messages"] = messages
             else:
-                category = classify(cfg, user_content, session_key=key, is_first=False)
+                # Context-window: classify last 3 user messages, not just this one
+                ctx_content = _recent_user_text(messages, n=3)
+                category = classify(cfg, ctx_content, session_key=key, is_first=False)
             cache_tier(key, category)
         else:
             last_text = _last_user_text(messages)
@@ -1578,8 +1614,9 @@ async def route_request(cfg: dict, payload: dict) -> JSONResponse:
                                 break
                         payload["messages"] = messages
                 else:
-                    user_content = _last_user_text(messages)
-                    category = classify(cfg, user_content, session_key=key, is_first=False)
+                    # Context-window: classify last 3 user messages on deviation
+                    ctx_content = _recent_user_text(messages, n=3)
+                    category = classify(cfg, ctx_content, session_key=key, is_first=False)
                 if category != cached:
                     log.info("Session %s category changed: %s → %s", key, cached, category)
                 cache_tier(key, category)
@@ -1708,6 +1745,63 @@ def _last_user_text(messages: list[dict]) -> str:
                 )
             return content
     return ""
+
+
+def _recent_user_text(messages: list[dict], n: int = 3) -> str:
+    """Concatenate recent messages (user + assistant) for context-window classification.
+
+    This solves the 'do it' problem: when a follow-up message is short/ambiguous
+    ("do it", "yes", "go ahead"), classifying just that message yields the wrong
+    category. By including the last few user messages plus the agent's replies,
+    the classifier sees the actual task context and routes correctly.
+
+    Includes up to n user messages and up to n-1 assistant replies (interleaved).
+    Assistant messages are truncated to 200 chars to stay within classifier
+    context windows (SetFit/zero-shot use all-MiniLM-L6-v2 with 256 token limit).
+
+    Messages are joined with " | " separator (not newlines) to keep the input
+    compact for fastText/SetFit which work best on short text.
+    """
+    # Collect recent user and assistant messages in reverse, then re-interleave
+    recent = []
+    user_count = 0
+    asst_count = 0
+    for m in reversed(messages):
+        role = m.get("role", "")
+        if role not in ("user", "assistant"):
+            continue
+        content = m.get("content", "")
+        if isinstance(content, list):
+            text = " ".join(
+                p.get("text", "") for p in content if isinstance(p, dict)
+            )
+        else:
+            text = content
+        if not text:
+            continue
+        # Truncate assistant messages to 200 chars to respect classifier context limits
+        if role == "assistant":
+            if asst_count >= n - 1:
+                continue
+            text = text[:200]
+            asst_count += 1
+        else:
+            if user_count >= n:
+                continue
+            user_count += 1
+        recent.append((role, text))
+        if user_count >= n and asst_count >= n - 1:
+            break
+    # Reverse to chronological order
+    recent.reverse()
+    # Format: [user] msg | [assistant] reply | [user] msg
+    parts = []
+    for role, text in recent:
+        if role == "assistant":
+            parts.append(f"[assistant] {text}")
+        else:
+            parts.append(text)
+    return " | ".join(parts)
 
 
 def _error(status: int, message: str) -> JSONResponse:
