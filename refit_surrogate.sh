@@ -16,14 +16,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_PY="/root/.hermes/hermes-agent/venv/bin/python3"
-SERVICE_NAME="router-proxy"
+SERVICE_NAME="hermes-router"
 
 echo "[$(date -Iseconds)] Starting weekly surrogate re-fit..."
 
 cd "$SCRIPT_DIR"
 
 # Step 1: Count classifier-source traces across all trace files
-TRACE_COUNT=$(grep -rc '"event":"classify"' traces/router-trace-*.jsonl .router/traces.jsonl 2>/dev/null | awk -F: '{sum+=$NF} END {print sum+0}')
+# (|| true: some listed files may not exist yet; grep exit 2 would kill the script under pipefail)
+TRACE_COUNT=$( { grep -rc '"event":"classify"' traces/router-trace-*.jsonl .router/traces.jsonl 2>/dev/null || true; } | awk -F: '{sum+=$NF} END {print sum+0}')
 
 echo "  Found $TRACE_COUNT classifier trace events"
 

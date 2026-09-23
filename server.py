@@ -85,6 +85,12 @@ try:
 except ImportError:
     get_setfit = lambda cfg: None  # noqa: E731
 
+# ── Laya classifier (tier 4, self-contained, no external model server) ────
+try:
+    from laya_classifier import get_laya_classifier
+except ImportError:
+    get_laya_classifier = lambda cfg: None  # noqa: E731
+
 # ── Logging ─────────────────────────────────────────────────────────────────
 class JsonFormatter(logging.Formatter):
     """Structured JSON log formatter — one line per record."""
@@ -642,7 +648,39 @@ def classify(cfg: dict, user_message: str, *, session_key: str | None = None, is
                 user_message[:60], confidence, surrogate.confidence_threshold,
             )
 
-    # ── Tier 4: LLM classifier (slow path, costs tokens, most accurate) ──
+    # ── Tier 4: Laya classifier (self-contained, ~370ms, no external server) ──
+    # Previously: LLM classifier calling GLM-4.7-Flash on docker-ssd:8002 (15s, ~50% accurate)
+    # Now: laya-multilingual Router, self-contained CPU inference, ~370ms, ~65% accurate
+    laya_clf = get_laya_classifier(cfg)
+    if laya_clf is not None:
+        t0 = time.time()
+        label, confidence = laya_clf.classify(user_message)
+        latency_ms = (time.time() - t0) * 1000
+        _record_classifier_latency(latency_ms)
+
+        if label in names:
+            model = cfg["categories"][label]["model"]
+            trace_classify(
+                session_key=session_key or "?",
+                user_message=user_message,
+                classifier_result=label,
+                classifier_raw=f"laya:{confidence:.4f}",
+                latency_ms=latency_ms,
+                tier=label,
+                model=f"laya/{laya_clf.model_name.split('/')[-1]}",
+                is_first=is_first,
+            )
+            log.info(
+                "Laya classified: '%s' -> %s (%.3f conf, %.0fms)",
+                user_message[:60], label, confidence, latency_ms,
+            )
+            return label
+        else:
+            log.warning(
+                "Laya returned invalid category '%s', falling back to default", label,
+            )
+
+    # ── Tier 4b: LLM classifier fallback (if laya is disabled or failed) ──
     t0 = time.time()
     prompt = build_classification_prompt(cfg, user_message)
     result = _call_classifier_raw(cfg, prompt, max_tokens=256)
@@ -1780,6 +1818,16 @@ def _startup() -> None:
                  sf_cfg.get("confidence_threshold", 0.55))
     else:
         log.info("  SetFit classifier: disabled")
+
+    # Laya classifier status
+    laya_cfg = cfg.get("classifier", {}).get("laya", {})
+    if laya_cfg.get("enabled"):
+        log.info("  Laya classifier: enabled (model=%s, device=%s, threshold=%.2f) [self-contained]",
+                 laya_cfg.get("model", "convaiinnovations/laya-multilingual"),
+                 laya_cfg.get("device", "cpu"),
+                 laya_cfg.get("confidence_threshold", 0.3))
+    else:
+        log.info("  Laya classifier: disabled (will fall back to LLM tier)")
 
     app.state.config = cfg
 

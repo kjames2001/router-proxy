@@ -65,10 +65,6 @@ class SentenceTransformerVectorizer(BaseEstimator, TransformerMixin):
                 normalize_embeddings=True,
             )
             for t, emb in zip(uncached, embeddings):
-                if len(self._cache) >= self._cache_max:
-                    # Evict oldest entry (insertion-order dict = FIFO)
-                    oldest = next(iter(self._cache))
-                    del self._cache[oldest]
                 self._cache[t] = emb
 
         return np.array([self._cache[t] for t in texts])

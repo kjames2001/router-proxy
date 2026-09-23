@@ -12,20 +12,47 @@ import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-TRACE_FILE = SCRIPT_DIR / "traces" / "router-trace-pretrain.jsonl"
+TRACE_DIR = SCRIPT_DIR / "traces"
 OUTPUT_DIR = SCRIPT_DIR / ".router" / "setfit"
+
+def _load_all_traces():
+    """Load classifier-labeled traces from all trace files.
+
+    Only traces labeled by an LLM teacher (not surrogate/fasttext/setfit
+    predictions) are used as training data.  This matches the surrogate's
+    extract_classifier_traces() logic.
+    """
+    import glob
+    all_samples = []
+    # Models whose predictions are ground-truth labels (LLM teachers)
+    # Anything starting with surrogate/, fasttext/, setfit/ is a local
+    # prediction and excluded.
+    skip_prefixes = ("surrogate/", "fasttext/", "setfit/")
+    for tf in sorted(glob.glob(str(TRACE_DIR / "router-trace-*.jsonl"))):
+        for line in open(tf):
+            try:
+                d = json.loads(line)
+                if d.get("event") != "classify":
+                    continue
+                model = d.get("model", "")
+                if model.startswith(skip_prefixes):
+                    continue
+                if not d.get("user_message_preview") or not d.get("classifier_result"):
+                    continue
+                all_samples.append(d)
+            except:
+                pass
+    return all_samples
 
 def main():
     from datasets import Dataset
     from setfit import SetFitModel, Trainer, TrainingArguments
 
-    # Load training data
-    if not TRACE_FILE.exists():
-        print("ERROR: No pretrain traces found. Run pretrain_surrogate.py first.")
+    # Load training data from all trace files
+    samples = _load_all_traces()
+    if not samples:
+        print("ERROR: No traces found. Run pretrain_surrogate.py or label_hermes_sessions.py first.")
         sys.exit(1)
-
-    lines = TRACE_FILE.read_text().strip().split("\n")
-    samples = [json.loads(l) for l in lines]
     print(f"Loaded {len(samples)} training samples")
 
     # Build dataset
@@ -57,9 +84,9 @@ def main():
     # Training arguments
     training_args = TrainingArguments(
         output_dir=str(OUTPUT_DIR),
-        num_epochs=10,
-        batch_size=16,
-        num_iterations=20,
+        num_epochs=3,
+        batch_size=8,
+        num_iterations=1,
         body_learning_rate=2e-5,
         head_learning_rate=0.01,
         sampling_strategy="oversampling",

@@ -91,17 +91,26 @@ class FastTextClassifier:
         """
         Classify text into a category.
 
-        Returns (category_name, confidence) where confidence is the
-        softmax probability (0.0 to 1.0).
+        Returns (category_name, confidence) where confidence is a
+        temperature-scaled probability (0.0 to 1.0).
+        Uses temperature=5 to soften fastText's overconfident softmax.
         Returns ("", 0.0) on any error.
         """
         if not self.enabled or self._model is None:
             return "", 0.0
 
         try:
-            labels, probs = self._model.predict(text)
+            # Get all labels with probabilities
+            labels, probs = self._model.predict(text, k=-1)
             label = labels[0].replace("__label__", "")
-            confidence = float(probs[0])
+
+            # Apply temperature scaling to soften overconfident predictions
+            import numpy as np
+            temp = 5.0
+            log_probs = np.log(np.array(probs) + 1e-10) / temp
+            scaled = np.exp(log_probs - log_probs.max())
+            scaled = scaled / scaled.sum()
+            confidence = float(scaled[0])
             return label, confidence
         except Exception as exc:
             log.warning("fastText predict error: %s", exc)
