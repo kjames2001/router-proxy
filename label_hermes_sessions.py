@@ -1,7 +1,7 @@
 """Label 2214 hermes session messages using the GLM-4.7-Flash classifier on docker-ssd.
 Outputs traces in the same JSONL format as the router-proxy, so fit_surrogate.py can consume them.
 """
-import json, time, re, sys
+import json, os, time, re, sys
 import httpx
 
 # Router-proxy classifier config
@@ -24,7 +24,7 @@ Reply with ONLY the category name, nothing else.
 
 BASE_URL = "https://ollama.com/v1"
 MODEL = "glm-5.3-flash"
-API_KEY = "REDACTED-OLLAMA-API-KEY"
+API_KEY = os.environ.get("OLLAMA_API_KEY", "")
 
 def classify(msg: str) -> str:
     prompt = SYSTEM_PROMPT.format(categories=", ".join(CATEGORIES), message=msg)
